@@ -2,36 +2,34 @@ import streamlit as st
 import pandas as pd
 import matplotlib.pyplot as plt
 from io import BytesIO
+from datetime import date
 
+# ----------------------------------------------------
+# PAGE CONFIG
+# ----------------------------------------------------
 st.set_page_config(page_title="Excel Dashboard", layout="wide")
 st.title("📊 Excel Dashboard Tool")
 
 # ----------------------------------------------------
-# SAFE & CORRECT EXCEL DATE HANDLER
+# EXCEL DATE FIXER (ROBUST & SAFE)
 # ----------------------------------------------------
-def fix_excel_dates(df):
+def fix_excel_dates(df: pd.DataFrame) -> pd.DataFrame:
     for col in df.columns:
 
-        # --- Case 1: Excel serial dates (numbers like 45992) ---
+        # ---- Excel serial dates (e.g. 45992) ----
         if pd.api.types.is_numeric_dtype(df[col]):
             series = df[col].dropna()
-
-            # Check if ALL values fall in valid Excel date range
             if not series.empty and series.between(30000, 60000).all():
                 df[col] = pd.to_datetime(
                     df[col],
                     origin="1899-12-30",
-                    unit="D"
-                ).dt.date
-
-        # --- Case 2: Text dates like 01/12/2025 ---
-        elif df[col].dtype == object:
-            if "date" in col.lower():
-                df[col] = pd.to_datetime(
-                    df[col],
-                    format="%d/%m/%Y",
-                    errors="ignore"
+                    unit="D",
+                    errors="coerce"
                 )
+
+        # ---- Text dates ----
+        elif df[col].dtype == object and "date" in col.lower():
+            df[col] = pd.to_datetime(df[col], errors="coerce")
 
     return df
 
@@ -43,18 +41,21 @@ uploaded_file = st.file_uploader("Upload Excel file", type=["xlsx", "xls"])
 if uploaded_file:
     try:
         xls = pd.ExcelFile(uploaded_file, engine="openpyxl")
-        sheet_name = st.selectbox("Select Sheet", xls.sheet_names)
-        header_row = st.number_input("Header row (first row = 1)", min_value=1, value=1)
 
-        # Read Excel WITHOUT date parsing
+        sheet = st.selectbox("Select sheet", xls.sheet_names)
+        header_row = st.number_input(
+            "Header row (first row = 1)",
+            min_value=1,
+            value=1
+        )
+
         df = pd.read_excel(
             xls,
-            sheet_name=sheet_name,
+            sheet_name=sheet,
             header=header_row - 1,
             engine="openpyxl"
         )
 
-        # Fix all Excel date formats
         df = fix_excel_dates(df)
 
         st.success("File loaded successfully")
@@ -73,7 +74,7 @@ if uploaded_file:
 
         for col in filter_cols:
 
-            # Numeric filter
+            # Numeric
             if pd.api.types.is_numeric_dtype(filtered_df[col]):
                 min_v, max_v = filtered_df[col].min(), filtered_df[col].max()
                 selected = st.slider(
@@ -83,22 +84,20 @@ if uploaded_file:
                     (float(min_v), float(max_v))
                 )
                 filtered_df = filtered_df[
-                    (filtered_df[col] >= selected[0]) &
-                    (filtered_df[col] <= selected[1])
+                    filtered_df[col].between(selected[0], selected[1])
                 ]
 
-            # Date filter
-            elif isinstance(filtered_df[col].dropna().iloc[0], pd.Timestamp) or \
-                 isinstance(filtered_df[col].dropna().iloc[0], pd.datetime.date):
-
-                min_d, max_d = filtered_df[col].min(), filtered_df[col].max()
+            # Date
+            elif pd.api.types.is_datetime64_any_dtype(filtered_df[col]):
+                min_d = filtered_df[col].min().date()
+                max_d = filtered_df[col].max().date()
                 selected = st.date_input(col, [min_d, max_d])
+
                 filtered_df = filtered_df[
-                    (filtered_df[col] >= selected[0]) &
-                    (filtered_df[col] <= selected[1])
+                    filtered_df[col].dt.date.between(selected[0], selected[1])
                 ]
 
-            # Text filter
+            # Text
             else:
                 values = filtered_df[col].dropna().unique().tolist()
                 selected = st.multiselect(col, values, default=values)
@@ -111,6 +110,7 @@ if uploaded_file:
         # KPIs
         # ------------------------------------------------
         st.subheader("KPIs")
+
         numeric_cols = filtered_df.select_dtypes(include="number").columns.tolist()
 
         if numeric_cols:
@@ -139,37 +139,14 @@ if uploaded_file:
         x_col = st.selectbox("X-axis", filtered_df.columns)
         y_cols = st.multiselect("Y-axis", numeric_cols)
         chart_type = st.selectbox(
-            "Chart Type",
+            "Chart type",
             ["Line", "Bar", "Pie", "Combo (Bar + Line)"]
         )
 
         if st.button("Generate Chart") and y_cols:
 
-            if chart_type in ["Line", "Bar", "Combo (Bar + Line)"]:
-                df_chart = filtered_df.set_index(x_col)[y_cols]
-                fig, ax = plt.subplots(figsize=(9, 4))
-
-                if chart_type == "Line":
-                    df_chart.plot.line(ax=ax)
-
-                elif chart_type == "Bar":
-                    df_chart.plot.bar(ax=ax)
-
-                else:  # Combo
-                    df_chart.plot.bar(ax=ax, alpha=0.6)
-                    df_chart.plot.line(secondary_y=True, ax=ax)
-
-                st.pyplot(fig)
-
-                buffer = BytesIO()
-                fig.savefig(buffer, format="png")
-                st.download_button(
-                    "⬇️ Download Chart",
-                    buffer,
-                    "chart.png"
-                )
-
-            elif chart_type == "Pie":
+            # ---------- PIE ----------
+            if chart_type == "Pie":
                 for col in y_cols:
                     fig, ax = plt.subplots()
                     filtered_df[col].value_counts().plot.pie(
@@ -180,6 +157,47 @@ if uploaded_file:
                     ax.set_ylabel("")
                     ax.set_title(col)
                     st.pyplot(fig)
+
+            # ---------- LINE / BAR / COMBO ----------
+            else:
+                plot_df = filtered_df.copy()
+
+                # Sort by X-axis if it is date
+                if pd.api.types.is_datetime64_any_dtype(plot_df[x_col]):
+                    plot_df = plot_df.sort_values(by=x_col)
+
+                    # Aggregate duplicates
+                    plot_df = plot_df.groupby(
+                        x_col, as_index=False
+                    )[y_cols].sum()
+
+                df_chart = plot_df.set_index(x_col)[y_cols]
+
+                fig, ax = plt.subplots(figsize=(10, 4))
+
+                if chart_type == "Line":
+                    df_chart.plot.line(ax=ax)
+
+                elif chart_type == "Bar":
+                    df_chart.plot.bar(ax=ax)
+
+                else:  # Combo
+                    df_chart.plot.bar(ax=ax, alpha=0.6)
+                    df_chart.plot.line(ax=ax, secondary_y=True)
+
+                ax.set_xlabel(x_col)
+                ax.set_ylabel(", ".join(y_cols))
+                plt.tight_layout()
+
+                st.pyplot(fig)
+
+                buffer = BytesIO()
+                fig.savefig(buffer, format="png")
+                st.download_button(
+                    "⬇️ Download chart",
+                    buffer,
+                    "chart.png"
+                )
 
     except Exception as e:
         st.error(f"Error: {e}")
